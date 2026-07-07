@@ -152,8 +152,9 @@ progress{width:100%;height:16px;accent-color:var(--aspen-teal)}
 <div id="importSection" class="hidden">
   <h2><span class="step-tag">4</span>Import to Firestore</h2>
   <div class="card">
-    <p class="muted" style="margin-top:0">Batched writes (500 ops max per batch), <code>set(..., {merge:true})</code>
-    with deterministic IDs — safe to re-run. Keep this tab open until it finishes.</p>
+    <p class="muted" style="margin-top:0">Throttle-safe: 200 ops per batch with a short pause between commits, plus
+    automatic exponential-backoff retry when Firestore returns <code>resource-exhausted</code>.
+    <code>set(..., {merge:true})</code> with deterministic IDs — safe to re-run and resume. Keep this tab open until it finishes.</p>
     <div class="pill-row">
       <button class="btn btn-primary" id="btnImport" disabled>Start import</button>
       <button class="btn btn-danger hidden" id="btnAbort">Abort</button>
@@ -168,7 +169,7 @@ progress{width:100%;height:16px;accent-color:var(--aspen-teal)}
 <script>
 'use strict';
 /* ================= CONSTANTS ================= */
-const APP_VERSION = 'qb-import-v2.0.1';
+const APP_VERSION = 'qb-import-v2.0.2';
 document.getElementById('verTag').textContent = APP_VERSION;
 
 const COL = {
@@ -579,11 +580,35 @@ $('btnImport').addEventListener('click', async () => {
   const t0 = Date.now();
   log(`[${APP_VERSION}] Import started — ${list.length} customers, ${totalOps} total writes`);
 
-  let batch = db.batch(), ops = 0, done = 0, errors = 0;
-  const flush = async () => {
+  // Tuned to stay under Firestore's sustained write ceiling and ride out
+  // resource-exhausted throttling instead of stalling on it.
+  const BATCH_SIZE = 200;        // ops per commit (was 450)
+  const PAUSE_MS = 250;          // breather between successful commits
+  const MAX_RETRIES = 6;         // per commit, exponential backoff
+  const sleep = ms => new Promise(r=>setTimeout(r, ms));
+
+  let batch = db.batch(), ops = 0, done = 0, committed = 0, retriedCommits = 0;
+  const commitWithRetry = async () => {
     if (!ops) return;
-    await batch.commit();
+    const b = batch, count = ops;
     batch = db.batch(); ops = 0;
+    let attempt = 0;
+    while (true){
+      try { await b.commit(); committed += count; return; }
+      catch(err){
+        const code = (err && err.code) || '';
+        const retryable = code==='resource-exhausted' || code==='unavailable' ||
+                          code==='deadline-exceeded' || code==='aborted';
+        if (!retryable || attempt >= MAX_RETRIES){
+          throw new Error(`${code||err.message} after ${attempt} retries (at ~${committed} writes)`);
+        }
+        attempt++; retriedCommits++;
+        const wait = Math.min(30000, 1000 * Math.pow(2, attempt)) + Math.random()*500;
+        log(`  ⏳ ${code} — backing off ${(wait/1000).toFixed(1)}s (retry ${attempt}/${MAX_RETRIES})`);
+        $('progText').textContent = `Throttled by Firestore — waiting ${(wait/1000).toFixed(0)}s… (${done.toLocaleString()}/${list.length.toLocaleString()})`;
+        await sleep(wait);
+      }
+    }
   };
   const add = (ref, data) => { batch.set(ref, data, { merge:true }); ops++; };
 
@@ -596,27 +621,27 @@ $('btnImport').addEventListener('click', async () => {
       docData.importedAt = firebase.firestore.FieldValue.serverTimestamp();
       const cref = db.collection('customers').doc(c.id);
       add(cref, docData);
-      if (ops >= 450) await flush();
+      if (ops >= BATCH_SIZE){ await commitWithRetry(); await sleep(PAUSE_MS); }
       if (withUnits){
         for (const u of units){
           const uid = 'u_' + hash64(c.qbName + ':' + u.rawJobName);
           add(cref.collection('units').doc(uid), { ...u, customerId:c.id });
-          if (ops >= 450) await flush();
+          if (ops >= BATCH_SIZE){ await commitWithRetry(); await sleep(PAUSE_MS); }
         }
       }
       done++;
-      if (done % 250 === 0 || done === list.length){
+      if (done % 200 === 0 || done === list.length){
         $('prog').value = Math.round(done/list.length*100);
-        $('progText').textContent = `${done.toLocaleString()} / ${list.length.toLocaleString()} customers`;
-        await new Promise(r=>setTimeout(r)); // let UI breathe
+        $('progText').textContent = `${done.toLocaleString()} / ${list.length.toLocaleString()} customers · ${committed.toLocaleString()} writes committed`;
+        await sleep(0); // let UI breathe
       }
     }
-    await flush();
+    await commitWithRetry();
     const secs = ((Date.now()-t0)/1000).toFixed(1);
-    log(`DONE in ${secs}s — ${done} customers written, ${errors} errors.`);
-    $('progText').textContent = `Completed: ${done.toLocaleString()} customers in ${secs}s`;
+    log(`DONE in ${secs}s — ${done} customers, ${committed} writes committed, ${retriedCommits} throttle-retries.`);
+    $('progText').textContent = `Completed: ${done.toLocaleString()} customers, ${committed.toLocaleString()} writes in ${secs}s`;
   } catch(err){
-    log('STOPPED: ' + err.message + ` (after ${done} customers)`);
+    log('STOPPED: ' + err.message + ` (after ${done} customers, ${committed} writes)`);
     alert('Import stopped: ' + err.message + '\nSafe to re-run — merge writes resume where it left off.');
   } finally {
     $('btnAbort').classList.add('hidden');
