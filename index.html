@@ -152,13 +152,18 @@ progress{width:100%;height:16px;accent-color:var(--aspen-teal)}
 <div id="importSection" class="hidden">
   <h2><span class="step-tag">4</span>Import to Firestore</h2>
   <div class="card">
-    <p class="muted" style="margin-top:0">Throttle-safe: 200 ops per batch with a short pause between commits, plus
-    automatic exponential-backoff retry when Firestore returns <code>resource-exhausted</code>.
-    <code>set(..., {merge:true})</code> with deterministic IDs — safe to re-run and resume. Keep this tab open until it finishes.</p>
+    <p class="muted" style="margin-top:0"><b>Automatic:</b> once Firestore is connected and you pick the file,
+    it syncs already-imported customers and writes only the missing ones — on its own, no clicks.
+    Throttle-safe (200 ops/batch, exponential-backoff retry on <code>resource-exhausted</code>) and
+    truly resumable via deterministic IDs, so re-running only writes what's new. The buttons below are
+    optional manual controls. Keep this tab open until it finishes.</p>
     <div class="pill-row">
       <button class="btn btn-primary" id="btnImport" disabled>Start import</button>
       <button class="btn btn-danger hidden" id="btnAbort">Abort</button>
+      <button class="btn btn-ghost" id="btnSyncExisting">Sync from Firestore</button>
+      <button class="btn btn-ghost" id="btnResetProgress">Reset progress</button>
     </div>
+    <p class="muted" id="resumeNote" style="margin:8px 0 0"></p>
     <div style="margin-top:12px"><progress id="prog" value="0" max="100"></progress>
       <div class="muted" id="progText"></div></div>
     <div id="log"></div>
@@ -169,7 +174,7 @@ progress{width:100%;height:16px;accent-color:var(--aspen-teal)}
 <script>
 'use strict';
 /* ================= CONSTANTS ================= */
-const APP_VERSION = 'qb-import-v2.0.2';
+const APP_VERSION = 'qb-import-v2.1.0';
 document.getElementById('verTag').textContent = APP_VERSION;
 
 const COL = {
@@ -461,6 +466,8 @@ $('fileInput').addEventListener('change', ev => {
       if (!rows) throw new Error('No sheet with a "Customer" column found.');
       MODEL = buildModel(rows);
       renderReview();
+      AUTO_RAN = false;   // re-arm auto mode for this newly loaded file
+      autoFlow();         // self-guards: runs only if Firestore is connected
     } catch(err){ alert('Parse error: ' + err.message); console.error(err); }
   };
   reader.readAsArrayBuffer(f);
@@ -506,7 +513,30 @@ function renderReview(){
 
 /* ================= FIREBASE ================= */
 let db = null, ABORT = false;
+let AUTO_RAN = false, IMPORTING = false;   // auto-mode guards (see AUTO MODE below)
 const LS_KEY = 'qbImportFbConfig';
+
+/* ================= RESUME CHECKPOINT ================= */
+// Persists the set of customer IDs already durably committed to Firestore, so
+// an aborted run / closed tab / re-run continues instead of restarting from
+// zero (the old code re-wrote every prior customer on each retry, which is what
+// repeatedly drained the daily write quota). Keyed by the deterministic FNV-1a
+// customer ID, so it survives file re-exports and import-option changes.
+// NOTE: resume SKIPS already-committed customers, so it does not push field
+// updates to customers already in Firestore — use "Reset progress" for a full
+// rewrite when the export data itself has changed.
+const LS_PROGRESS = 'qbImportProgress_v2';
+function loadCommitted(){
+  try { const raw = localStorage.getItem(LS_PROGRESS); return new Set(raw ? JSON.parse(raw) : []); }
+  catch(_e){ return new Set(); }
+}
+function saveCommitted(set){
+  try { localStorage.setItem(LS_PROGRESS, JSON.stringify([...set])); } catch(_e){}
+}
+function clearCommitted(){
+  try { localStorage.removeItem(LS_PROGRESS); } catch(_e){}
+}
+function committedCount(){ return loadCommitted().size; }
 
 function setConn(txt, cls){ const el=$('connState'); el.textContent=txt; el.className='conn ' + (cls||''); }
 
@@ -533,6 +563,7 @@ async function connect(cfgText){
     db = firebase.firestore();
     localStorage.setItem(LS_KEY, cfgText);
     setConn('Firebase: connected (' + (cfg.projectId||'?') + ')', 'ok');
+    autoFlow();   // if a file is already loaded, start the automatic run now
   } catch(err){
     setConn('Firebase: error', 'err');
     alert('Firebase connection failed: ' + err.message +
@@ -566,19 +597,106 @@ function selectedCustomers(){
 
 $('btnAbort').addEventListener('click', ()=>{ ABORT = true; });
 
-$('btnImport').addEventListener('click', async () => {
+function refreshResumeNote(){
+  const el = $('resumeNote'); if (!el) return;
+  const n = committedCount();
+  el.textContent = n
+    ? `Resume ready: ${n.toLocaleString()} customers already imported will be skipped on the next run. Use "Reset progress" to force a full rewrite.`
+    : '';
+}
+$('btnResetProgress').addEventListener('click', ()=>{
+  const n = committedCount();
+  if (!n){ alert('No saved progress to reset.'); return; }
+  if (!confirm(`Reset import progress?\n\nThis clears the record of ${n.toLocaleString()} already-imported customers, so the next run re-writes ALL selected customers from scratch. Firestore data is NOT deleted.`)) return;
+  clearCommitted();
+  refreshResumeNote();
+  alert('Progress reset. The next import starts from the beginning.');
+});
+
+// Seed the resume checkpoint from what's ALREADY in Firestore. Reads only the
+// document IDs of the customers collection (cheap) and marks them done, so a
+// run started on a fresh device / after clearing localStorage skips the
+// customers already imported instead of re-writing all 14K. One read per
+// existing doc; no writes. silent=true suppresses confirms/alerts (auto mode).
+async function syncExistingIds(silent){
+  if (!db){ if (!silent) alert('Connect to Firestore first (Step 1).'); return; }
+  if (!silent && !confirm('Read the IDs already in Firestore and mark them as done?\n\nThis lets the import skip customers already imported, so it only writes the missing ones. Reads are cheap; nothing is written or deleted.')) return;
+  const btn = $('btnSyncExisting'); const label = btn.textContent; btn.disabled = true; btn.textContent = 'Syncing…';
+  try {
+    const existing = loadCommitted();
+    let last = null, fetched = 0, before = existing.size;
+    // Page through the collection ordered by document ID, IDs only.
+    while (true){
+      let q = db.collection('customers').orderBy(firebase.firestore.FieldPath.documentId()).limit(2000);
+      if (last) q = q.startAfter(last);
+      const snap = await q.get();
+      if (snap.empty) break;
+      snap.forEach(d=>{ existing.add(d.id); });
+      fetched += snap.size;
+      last = snap.docs[snap.docs.length-1].id;
+      $('progText').textContent = `Synced ${fetched.toLocaleString()} existing customer IDs…`;
+      if (snap.size < 2000) break;
+    }
+    saveCommitted(existing);
+    refreshResumeNote();
+    const added = existing.size - before;
+    log(`Synced ${fetched.toLocaleString()} IDs from Firestore — ${added.toLocaleString()} new to checkpoint (${existing.size.toLocaleString()} total marked done).`);
+    $('progText').textContent = `Done: ${existing.size.toLocaleString()} customers marked as already imported.`;
+    if (!silent) alert(`${existing.size.toLocaleString()} customers are now marked as done.\n\nThe next Start will skip them and only write the missing ones.`);
+  } catch(err){
+    log('SYNC FAILED: ' + ((err&&err.message)||err));
+    if (!silent) alert('Sync failed: ' + ((err&&err.message)||err));
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+$('btnSyncExisting').addEventListener('click', ()=>syncExistingIds(false));
+
+refreshResumeNote();
+
+/* ================= AUTO MODE ================= */
+// Pick the .xlsx (the one unavoidable step — browsers can't read a local file
+// without the user choosing it) and everything else runs on its own: connect
+// (restored config), sync already-imported IDs from Firestore, then import only
+// the missing customers. No buttons. Re-running is a no-op because sync+resume
+// skip everything already done, so auto mode is safe to trigger on file load.
+// (AUTO_RAN / IMPORTING are declared at the top of the script.)
+async function autoFlow(){
+  if (AUTO_RAN || IMPORTING) return;
+  if (!db || !MODEL) return;            // need both a live connection and a parsed file
+  AUTO_RAN = true;
+  log('Auto mode — syncing existing customers from Firestore, then importing only the missing ones…');
+  $('progText').textContent = 'Auto mode: syncing with Firestore…';
+  try {
+    await syncExistingIds(true);        // silent
+    await runImport(true);              // auto: no confirm, writes only what's missing
+  } catch(_e){ /* runImport / syncExistingIds log their own errors */ }
+}
+
+async function runImport(auto){
   if (!db || !MODEL) return;
+  if (IMPORTING) return; IMPORTING = true;
+  try {
   const list = selectedCustomers();
   const withUnits = $('optUnits').checked;
   const totalOps = list.reduce((n,c)=>n + 1 + (withUnits ? c.unitCount : 0), 0);
-  if (!confirm(`Import ${list.length.toLocaleString()} customers` +
+
+  // Resume: load the customer IDs already committed in a prior run and skip them.
+  const committedIds = loadCommitted();
+  const alreadyDone = list.reduce((n,c)=>n + (committedIds.has(c.id) ? 1 : 0), 0);
+  const remaining = list.length - alreadyDone;
+
+  if (!auto && !confirm(`Import ${list.length.toLocaleString()} customers` +
       (withUnits ? ` + ${(totalOps-list.length).toLocaleString()} units` : '') +
-      ` to Firestore (${totalOps.toLocaleString()} writes)?\n\nDeterministic IDs: re-running upserts, no duplicates.`)) return;
+      ` to Firestore (${totalOps.toLocaleString()} writes max).` +
+      (alreadyDone ? `\n\nResuming: ${alreadyDone.toLocaleString()} already imported, ${remaining.toLocaleString()} to go.` : '') +
+      `\n\nDeterministic IDs: re-running upserts, no duplicates.`)) return;
 
   ABORT = false;
   $('btnImport').disabled = true; $('btnAbort').classList.remove('hidden');
   const t0 = Date.now();
-  log(`[${APP_VERSION}] Import started — ${list.length} customers, ${totalOps} total writes`);
+  log(`[${APP_VERSION}] Import started — ${list.length} customers` +
+      (alreadyDone ? ` (${alreadyDone} already committed, resuming ${remaining})` : '') + `, ${totalOps} writes max`);
 
   // Tuned to stay under Firestore's sustained write ceiling and ride out
   // resource-exhausted throttling instead of stalling on it.
@@ -588,13 +706,22 @@ $('btnImport').addEventListener('click', async () => {
   const sleep = ms => new Promise(r=>setTimeout(r, ms));
 
   let batch = db.batch(), ops = 0, done = 0, committed = 0, retriedCommits = 0;
+  let pendingIds = [];   // customer IDs fully enqueued since the last successful commit
   const commitWithRetry = async () => {
     if (!ops) return;
     const b = batch, count = ops;
+    const flushIds = pendingIds; pendingIds = [];
     batch = db.batch(); ops = 0;
     let attempt = 0;
     while (true){
-      try { await b.commit(); committed += count; return; }
+      try {
+        await b.commit();
+        committed += count;
+        // These customers are now durably in Firestore — record them so a
+        // re-run skips them instead of re-writing from zero.
+        if (flushIds.length){ flushIds.forEach(id=>committedIds.add(id)); saveCommitted(committedIds); }
+        return;
+      }
       catch(err){
         const code = (err && err.code) || '';
         const retryable = code==='resource-exhausted' || code==='unavailable' ||
@@ -615,6 +742,7 @@ $('btnImport').addEventListener('click', async () => {
   try {
     for (const c of list){
       if (ABORT) throw new Error('Aborted by user');
+      if (committedIds.has(c.id)){ done++; continue; }   // resume: already in Firestore, skip
       const { units, internal, ...docData } = c;
       docData.source = 'qb-import-v2';
       docData.appVersion = APP_VERSION;
@@ -629,6 +757,7 @@ $('btnImport').addEventListener('click', async () => {
           if (ops >= BATCH_SIZE){ await commitWithRetry(); await sleep(PAUSE_MS); }
         }
       }
+      pendingIds.push(c.id);   // fully enqueued; recorded as done on the next successful commit
       done++;
       if (done % 200 === 0 || done === list.length){
         $('prog').value = Math.round(done/list.length*100);
@@ -638,16 +767,21 @@ $('btnImport').addEventListener('click', async () => {
     }
     await commitWithRetry();
     const secs = ((Date.now()-t0)/1000).toFixed(1);
-    log(`DONE in ${secs}s — ${done} customers, ${committed} writes committed, ${retriedCommits} throttle-retries.`);
-    $('progText').textContent = `Completed: ${done.toLocaleString()} customers, ${committed.toLocaleString()} writes in ${secs}s`;
+    $('prog').value = 100;
+    log(`DONE in ${secs}s — ${done} customers processed, ${committed} writes committed this run, ${retriedCommits} throttle-retries. Total in Firestore: ${committedIds.size.toLocaleString()}.`);
+    $('progText').textContent = `Completed: ${done.toLocaleString()} customers (${committed.toLocaleString()} writes this run) in ${secs}s`;
   } catch(err){
-    log('STOPPED: ' + err.message + ` (after ${done} customers, ${committed} writes)`);
-    alert('Import stopped: ' + err.message + '\nSafe to re-run — merge writes resume where it left off.');
+    saveCommitted(committedIds); // persist everything confirmed before the stop
+    log('STOPPED: ' + err.message + ` (after ${done} customers, ${committed} writes this run; ${committedIds.size.toLocaleString()} saved for resume)`);
+    alert('Import stopped: ' + err.message + '\n\nProgress is saved — press Start again to resume. Already-imported customers are skipped, so it picks up where it left off.');
   } finally {
     $('btnAbort').classList.add('hidden');
     refreshImportBtn();
+    refreshResumeNote();
   }
-});
+  } finally { IMPORTING = false; }
+}
+$('btnImport').addEventListener('click', ()=>runImport(false));
 </script>
 </body>
 </html>
