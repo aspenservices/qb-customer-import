@@ -168,7 +168,7 @@ progress{width:100%;height:16px;accent-color:var(--aspen-teal)}
 <script>
 'use strict';
 /* ================= CONSTANTS ================= */
-const APP_VERSION = 'qb-import-v2.0.0';
+const APP_VERSION = 'qb-import-v2.0.1';
 document.getElementById('verTag').textContent = APP_VERSION;
 
 const COL = {
@@ -511,7 +511,18 @@ function setConn(txt, cls){ const el=$('connState'); el.textContent=txt; el.clas
 
 async function connect(cfgText){
   let cfg;
-  try { cfg = JSON.parse(cfgText); } catch(e){ alert('Config is not valid JSON.'); return; }
+  try {
+    // Accept both strict JSON and the JS snippet Firebase shows in the console
+    // ("const firebaseConfig = { apiKey: '...', ... };" with unquoted keys).
+    let t = String(cfgText||'').trim();
+    t = t.replace(/^\s*(?:const|let|var)\s+\w+\s*=\s*/,''); // drop "const firebaseConfig ="
+    t = t.replace(/;\s*$/,'');                               // drop trailing ;
+    const braceStart = t.indexOf('{'), braceEnd = t.lastIndexOf('}');
+    if (braceStart >= 0 && braceEnd > braceStart) t = t.slice(braceStart, braceEnd+1);
+    // parse leniently: this is the user's own config pasted locally, never remote input
+    cfg = (new Function('return (' + t + ')'))();
+    if (!cfg || typeof cfg !== 'object' || !cfg.projectId) throw new Error('missing projectId');
+  } catch(e){ alert('Could not read the config. Paste the object from Firebase console (Config option).\n\n' + e.message); return; }
   try {
     if (firebase.apps.length) firebase.app().delete && await firebase.app().delete();
   } catch(e){ /* first run */ }
