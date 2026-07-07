@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QB Customer Import v2 — Aspen Spas</title>
+<!-- ============================================================
+     QB Customer Import v2
+     QuickBooks Enterprise Desktop 24.0 "Customer Contact List"
+     (.xlsx export) -> Firestore master (project: tech-tickets-a9485)
+
+     Phase 0 of the Aspen customer-centralization plan.
+     - Collapses Customer:Job rows into one parent customer
+     - Units (spas/jobs) written to subcollection customers/{id}/units
+     - Deterministic FNV-1a doc IDs => re-running the import upserts,
+       never duplicates
+     - Dedup keys precomputed: phoneKeys / emailKeys / nameZipKey
+     - No Cloud Functions. Single file. Vanilla JS.
+     ============================================================ -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&family=Source+Sans+3:wght@400;500;600&display=swap');
+:root{
+  --aspen-deep-blue:#134A63; --aspen-teal:#1C8FA8; --aspen-aqua:#4FC3D9;
+  --aspen-copper:#B5733A; --aspen-charcoal:#1F2A30; --aspen-slate:#5A6A72;
+  --aspen-mist:#E9EFF1; --aspen-offwhite:#F7FAFB; --aspen-white:#FFFFFF;
+  --aspen-success:#2E8B57; --aspen-warning:#D99A2B; --aspen-danger:#C0492F;
+  --aspen-font-head:'Poppins',system-ui,sans-serif;
+  --aspen-font-body:'Source Sans 3',system-ui,-apple-system,sans-serif;
+  --aspen-radius:12px; --aspen-shadow:0 2px 8px rgba(19,74,99,.08);
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:var(--aspen-font-body);color:var(--aspen-charcoal);
+  background:var(--aspen-offwhite);line-height:1.6}
+header{background:var(--aspen-deep-blue);color:#fff;padding:14px 20px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font-family:var(--aspen-font-head);font-size:1.15rem;margin:0;color:#fff;letter-spacing:-.01em}
+header .ver{font-size:.75rem;opacity:.75}
+header .conn{margin-left:auto;font-size:.8rem;padding:4px 10px;border-radius:20px;background:rgba(255,255,255,.15)}
+header .conn.ok{background:var(--aspen-success)}
+header .conn.err{background:var(--aspen-danger)}
+main{max-width:1100px;margin:0 auto;padding:20px 16px 80px}
+h2{font-family:var(--aspen-font-head);color:var(--aspen-deep-blue);font-size:1.05rem;
+  letter-spacing:-.01em;line-height:1.2;margin:26px 0 10px}
+.card{background:var(--aspen-white);border:1px solid var(--aspen-mist);
+  border-radius:var(--aspen-radius);box-shadow:var(--aspen-shadow);padding:16px;margin-bottom:14px}
+.step-tag{display:inline-block;background:var(--aspen-teal);color:#fff;font-family:var(--aspen-font-head);
+  font-size:.7rem;font-weight:600;border-radius:20px;padding:2px 10px;vertical-align:middle;margin-right:8px}
+.btn{border:none;border-radius:var(--aspen-radius);padding:10px 18px;cursor:pointer;
+  font-family:var(--aspen-font-head);font-weight:600;font-size:.9rem;min-height:44px}
+.btn-primary{background:var(--aspen-deep-blue);color:#fff}
+.btn-primary:hover{background:var(--aspen-teal)}
+.btn-primary:disabled{background:var(--aspen-slate);cursor:not-allowed;opacity:.6}
+.btn-ghost{background:var(--aspen-mist);color:var(--aspen-deep-blue)}
+.btn-danger{background:var(--aspen-danger);color:#fff}
+textarea,input[type=file]{width:100%;font-family:monospace;font-size:.8rem;
+  border:1px solid var(--aspen-mist);border-radius:8px;padding:10px}
+textarea{min-height:110px;resize:vertical}
+.muted{color:var(--aspen-slate);font-size:.85rem}
+.grid-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
+.stat{background:var(--aspen-white);border:1px solid var(--aspen-mist);border-radius:var(--aspen-radius);
+  padding:12px;text-align:center}
+.stat .n{font-family:var(--aspen-font-head);font-weight:700;font-size:1.5rem;color:var(--aspen-deep-blue)}
+.stat .l{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--aspen-slate)}
+.stat.warn .n{color:var(--aspen-warning)}
+.stat.bad .n{color:var(--aspen-danger)}
+.opts label{display:flex;align-items:center;gap:10px;padding:8px 4px;font-size:.92rem;cursor:pointer}
+.opts input[type=checkbox]{width:18px;height:18px;accent-color:var(--aspen-teal)}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th{font-family:var(--aspen-font-head);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--aspen-slate);text-align:left;padding:8px 6px;border-bottom:2px solid var(--aspen-mist)}
+td{padding:7px 6px;border-bottom:1px solid var(--aspen-mist);vertical-align:top}
+.badge{display:inline-block;font-size:.65rem;font-weight:600;border-radius:10px;padding:1px 8px;margin:1px 2px 1px 0;white-space:nowrap}
+.b-inactive{background:var(--aspen-mist);color:var(--aspen-slate)}
+.b-cancel{background:#F6E3DE;color:var(--aspen-danger)}
+.b-dns{background:var(--aspen-danger);color:#fff}
+.b-ah{background:var(--aspen-copper);color:#fff}
+.b-chan{background:var(--aspen-teal);color:#fff}
+.b-dup{background:var(--aspen-warning);color:#fff}
+.tbl-wrap{overflow-x:auto}
+progress{width:100%;height:16px;accent-color:var(--aspen-teal)}
+#log{background:var(--aspen-charcoal);color:#cfe8ef;font-family:monospace;font-size:.75rem;
+  border-radius:8px;padding:12px;max-height:260px;overflow-y:auto;white-space:pre-wrap;display:none}
+.hidden{display:none}
+.pill-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+@media(max-width:480px){header h1{font-size:1rem}}
+</style>
+</head>
+<body>
+<header>
+  <h1>QB Customer Import v2</h1>
+  <span class="ver" id="verTag"></span>
+  <span class="conn" id="connState">Firebase: not configured</span>
+</header>
+<main>
+
+<!-- STEP 1 : FIREBASE -->
+<h2><span class="step-tag">1</span>Connect to Firestore (tech-tickets-a9485)</h2>
+<div class="card">
+  <p class="muted" style="margin-top:0">Paste the <b>firebaseConfig</b> JSON from the TECH-TICKETS project
+  (Firebase console → Project settings → Your apps). Stored in <code>localStorage</code> only — never hardcoded.
+  Requires Anonymous Auth enabled and Firestore rules that allow authed writes to <code>customers/**</code>.</p>
+  <textarea id="fbConfig" placeholder='{ "apiKey": "...", "authDomain": "tech-tickets-a9485.firebaseapp.com", "projectId": "tech-tickets-a9485", ... }'></textarea>
+  <div class="pill-row">
+    <button class="btn btn-primary" id="btnConnect">Connect</button>
+    <button class="btn btn-ghost" id="btnForget">Forget saved config</button>
+  </div>
+</div>
+
+<!-- STEP 2 : FILE -->
+<h2><span class="step-tag">2</span>Load the QuickBooks export (.xlsx)</h2>
+<div class="card">
+  <p class="muted" style="margin-top:0">Customer Contact List export from QB Enterprise Desktop 24.0.
+  Everything is parsed locally in your browser — nothing leaves this page until Step 4.</p>
+  <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+</div>
+
+<!-- STEP 3 : REVIEW -->
+<div id="reviewSection" class="hidden">
+  <h2><span class="step-tag">3</span>Review parsed data</h2>
+  <div class="grid-stats" id="statsGrid"></div>
+  <div class="card opts">
+    <b style="font-family:var(--aspen-font-head)">Import options</b>
+    <label><input type="checkbox" id="optSkipInternal" checked>
+      Skip internal / house accounts (ASPEN SHOWROOM, Aspel UK)</label>
+    <label><input type="checkbox" id="optSkipInactive">
+      Skip customers flagged <b>**INACTIVE**</b></label>
+    <label><input type="checkbox" id="optSkipCancelled">
+      Skip customers flagged <b>CANCELLED</b></label>
+    <label><input type="checkbox" id="optUnits" checked>
+      Import units (jobs/spas) to subcollection <code>customers/{id}/units</code></label>
+  </div>
+  <div class="card">
+    <b style="font-family:var(--aspen-font-head)">Possible duplicates (manual review — never auto-merged)</b>
+    <p class="muted">Distinct QB customers sharing a phone, an email, or name-tokens+ZIP.
+    Both are imported and cross-linked via <code>possibleDuplicateOf</code>.</p>
+    <div class="tbl-wrap"><table id="dupTable"><thead>
+      <tr><th>Key</th><th>Match type</th><th>Customers</th></tr></thead><tbody></tbody></table></div>
+  </div>
+  <div class="card">
+    <b style="font-family:var(--aspen-font-head)">Preview (first 25 customers)</b>
+    <div class="tbl-wrap"><table id="prevTable"><thead>
+      <tr><th>Display name</th><th>Flags</th><th>Primary phone</th><th>Primary email</th>
+      <th>City / ZIP</th><th>Units</th></tr></thead><tbody></tbody></table></div>
+  </div>
+</div>
+
+<!-- STEP 4 : IMPORT -->
+<div id="importSection" class="hidden">
+  <h2><span class="step-tag">4</span>Import to Firestore</h2>
+  <div class="card">
+    <p class="muted" style="margin-top:0">Batched writes (500 ops max per batch), <code>set(..., {merge:true})</code>
+    with deterministic IDs — safe to re-run. Keep this tab open until it finishes.</p>
+    <div class="pill-row">
+      <button class="btn btn-primary" id="btnImport" disabled>Start import</button>
+      <button class="btn btn-danger hidden" id="btnAbort">Abort</button>
+    </div>
+    <div style="margin-top:12px"><progress id="prog" value="0" max="100"></progress>
+      <div class="muted" id="progText"></div></div>
+    <div id="log"></div>
+  </div>
+</div>
+
+</main>
+<script>
+'use strict';
+/* ================= CONSTANTS ================= */
+const APP_VERSION = 'qb-import-v2.0.0';
+document.getElementById('verTag').textContent = APP_VERSION;
+
+const COL = {
+  customer:'Customer', bill:['Bill to 1','Bill to 2','Bill to 3','Bill to 4','Bill to 5'],
+  billRaw:'Bill to', altPhone:'Alt. Phone', mainEmail:'Main Email', ccEmail:'CC Email',
+  mainPhone:'Main Phone', workPhone:'Work Phone', fax:'Fax',
+  account:'Account No.', type:'Customer Type', note:'Note'
+};
+const DEALER_CODES = ['A/MC','FMBA','BULLDOG','AMA','Aspen','Blithe','BGH','AS','MC','A','B'];
+const INTERNAL_PATTERNS = [/ASPEN SHOWROOM/i, /Aspel UK/i];
+const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
+const PHONE_RE = /\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/;
+const CSZ_RE = /^(.*?),?\s+([A-Za-z]{2})\.?,?\s+(\d{5})(?:-\d{4})?\s*$/;
+
+/* ================= HELPERS ================= */
+const $ = id => document.getElementById(id);
+function fnv1a(str, seed){ // 32-bit FNV-1a
+  let h = seed >>> 0;
+  for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+}
+function hash64(str){ // two independent seeds -> 16 hex chars, deterministic IDs
+  return fnv1a(str, 0x811c9dc5) + fnv1a(str, 0x01234567);
+}
+function normPhone(v){
+  let d = String(v||'').replace(/\D/g,'');
+  if (d.length === 11 && d[0] === '1') d = d.slice(1);
+  return d.length === 10 ? d : null;
+}
+function phoneLabel(v){
+  const words = String(v||'').replace(/Phone:?/ig,'').match(/[A-Za-z][A-Za-z ]{1,30}/g);
+  return words ? words.join(' ').trim() : '';
+}
+function normName(s){
+  return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ');
+}
+function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
+function log(msg){
+  const el = $('log'); el.style.display='block';
+  el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight;
+}
+
+/* ================= NAME / FLAG PARSER ================= */
+function parseParentName(raw){
+  let name = String(raw||'').trim();
+  const flags = [];
+  let status = 'active';
+  if (/INACTIVE/i.test(name)) status = 'inactive';
+  else if (/CANCEL{1,2}(ED|LED)?/i.test(name)) status = 'cancelled';
+  if (/DO NOT HELP/i.test(name)) flags.push('DO_NOT_HELP');
+  if (/DO NOT SELL/i.test(name)) flags.push('DO_NOT_SELL');
+  if (/BAD DEBT/i.test(name))    flags.push('BAD_DEBT');
+  // AH marker: only when adjacent to asterisks, standalone "- AH"/"AH" tail, or "**AH**"
+  if (/\*+\s*AH\b|\bAH\s*\*+|(?:^|\s)[-–]\s*AH\b\s*$|\bAH\b\s*\?*\s*$/.test(name) || /\bAH RETAIL\b/i.test(name))
+    flags.push('AH');
+  // strip flag noise from display name
+  let display = name
+    .replace(/\*{1,}[^*]*INACTIVE[^*]*\*{0,}/ig,' ')
+    .replace(/\*{1,}[^*]*CANCEL[^*]*\*{0,}/ig,' ')
+    .replace(/\*{2,}[^*]*(DO NOT HELP|DO NOT SELL|BAD DEBT)[^*]*/ig,' ')
+    .replace(/DO NOT HELP,?\s*(BAD DEBT)?/ig,' ')
+    .replace(/DO NOT SELL( OR SHIP)?/ig,' ')
+    .replace(/BAD DEBT/ig,' ')
+    .replace(/\*+\s*AH\b|\bAH\s*\*+/g,' ')
+    .replace(/\*+/g,' ')
+    .trim();
+  // dealer / channel suffix ("- MC", "- AMA", ...)
+  let channel = null;
+  for (const code of DEALER_CODES){
+    const re = new RegExp('\\s*[-–]\\s*' + code.replace('/','\\/') + '\\s*$');
+    if (re.test(display)){ channel = code.toUpperCase(); display = display.replace(re,'').trim(); break; }
+  }
+  display = display.replace(/[\s,;-]+$/,'').replace(/\s{2,}/g,' ').trim() || name;
+  return { qbName:name, displayName:display, status, flags, channel };
+}
+
+/* ================= ADDRESS PARSER (parse from the end) ================= */
+function parseAddress(lines, phoneSink){
+  const rest = lines.map(s=>String(s||'').trim()).filter(Boolean);
+  const out = { attn:'', company:'', street:'', city:'', state:'', zip:'', raw:rest.join(' | ') };
+  // 1) pull phone-ish lines out (they land in Bill to 4/5 constantly)
+  for (let i=rest.length-1; i>=0; i--){
+    if (PHONE_RE.test(rest[i]) && !CSZ_RE.test(rest[i])){
+      const n = normPhone(rest[i].match(PHONE_RE)[0]);
+      if (n) phoneSink.push({ number:n, label:phoneLabel(rest[i]) || 'from address', source:'billto' });
+      rest.splice(i,1);
+    }
+  }
+  // 2) City, ST ZIP scanning from the end
+  let cszIdx = -1;
+  for (let i=rest.length-1; i>=0; i--){
+    const m = rest[i].match(CSZ_RE);
+    if (m){ out.city=m[1].trim(); out.state=m[2].toUpperCase(); out.zip=m[3]; cszIdx=i; break; }
+  }
+  const head = cszIdx >= 0 ? rest.slice(0,cszIdx) : rest.slice();
+  // 3) street = last head line that looks like one (starts with digit / PO Box)
+  for (let i=head.length-1; i>=0; i--){
+    if (/^\d|^P\.?\s?O\.?\s*Box/i.test(head[i])){ out.street = head.splice(i,1)[0]; break; }
+  }
+  // 4) leftovers: [attn?, company?]
+  if (head.length === 1) out.company = head[0];
+  else if (head.length >= 2){ out.attn = head[0]; out.company = head.slice(1).join(', '); }
+  return out;
+}
+
+/* ================= UNIT (JOB) PARSER ================= */
+function parseUnit(suffix, note){
+  const u = { rawJobName: suffix, date:null, seq:null, model:'', serial:null, note: String(note||'').trim() };
+  const m = suffix.match(/^\s*(\d{4})\s+(\d{1,2})\/(\d{1,2})\s*(?:#\s*(\d+))?\s*[-–]?\s*(.*)$/);
+  if (m){
+    u.date = m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0');
+    if (m[4]) u.seq = parseInt(m[4],10);
+    u.model = (m[5]||'').trim();
+  } else {
+    const n = suffix.match(/#\s*(\d+)/);
+    if (n) u.seq = parseInt(n[1],10);
+    u.model = suffix.replace(/#\s*\d+/,'').replace(/^[\s\-–]+/,'').trim();
+  }
+  const s = u.note.match(/SERIAL\s*#?\s*([0-9]{3,})/i);
+  if (s) u.serial = s[1];
+  return u;
+}
+
+/* ================= WORKBOOK -> MODEL ================= */
+let MODEL = null; // { customers:[], stats:{} }
+
+function buildModel(rows){
+  // group rows by parent (split on FIRST colon only — nested jobs exist)
+  const groups = new Map();
+  for (const r of rows){
+    const full = String(r[COL.customer]||'').trim();
+    if (!full) continue;
+    const ci = full.indexOf(':');
+    const parent = ci < 0 ? full : full.slice(0,ci);
+    const jobSuffix = ci < 0 ? null : full.slice(ci+1).trim();
+    if (!groups.has(parent)) groups.set(parent, { parentRow:null, jobRows:[] });
+    const g = groups.get(parent);
+    if (jobSuffix === null) g.parentRow = r;
+    else g.jobRows.push({ suffix: jobSuffix, row: r });
+  }
+
+  const customers = [];
+  const stats = { rows:rows.length, parents:groups.size, units:0, inactive:0, cancelled:0,
+                  doNotService:0, ah:0, internal:0, noPhone:0, noEmail:0, unparsedUnits:0 };
+
+  for (const [parentName, g] of groups){
+    const meta = parseParentName(parentName);
+    const allRows = g.parentRow ? [g.parentRow, ...g.jobRows.map(j=>j.row)] : g.jobRows.map(j=>j.row);
+    const baseRow = g.parentRow || (g.jobRows[0] && g.jobRows[0].row) || {};
+
+    // --- phones: union across the whole group, frequency-ranked ---
+    const phoneMap = new Map(); // number -> {number,label,source,count}
+    const addPhone = (val, source) => {
+      const n = normPhone(val); if (!n) return;
+      const e = phoneMap.get(n) || { number:n, label:phoneLabel(val), source, count:0 };
+      e.count++; if (!e.label) e.label = phoneLabel(val);
+      phoneMap.set(n, e);
+    };
+    for (const r of allRows){
+      addPhone(r[COL.mainPhone],'main'); addPhone(r[COL.workPhone],'work');
+      addPhone(r[COL.altPhone],'alt');   addPhone(r[COL.fax],'fax');
+    }
+    // --- address (parent row preferred) + phones hidden in Bill to ---
+    const phoneSink = [];
+    const address = parseAddress(COL.bill.map(c=>baseRow[c]), phoneSink);
+    for (const p of phoneSink){
+      const e = phoneMap.get(p.number) || { number:p.number, label:p.label, source:p.source, count:0 };
+      e.count++; phoneMap.set(p.number, e);
+    }
+    const phones = [...phoneMap.values()].sort((a,b)=>b.count-a.count);
+    let primaryPhone = phones.length ? phones[0].number : null;
+    const parentMain = g.parentRow ? normPhone(g.parentRow[COL.mainPhone]) : null;
+    if (parentMain && phones.length && phones[0].count === (phoneMap.get(parentMain)||{count:-1}).count)
+      primaryPhone = parentMain; // tie-break: parent row's Main Phone
+
+    // --- emails: union, primary = parent Main Email ---
+    const emailSet = new Set();
+    for (const r of allRows){
+      for (const c of [COL.mainEmail, COL.ccEmail]){
+        const found = String(r[c]||'').match(EMAIL_RE);
+        if (found) found.forEach(e=>emailSet.add(e.toLowerCase()));
+      }
+    }
+    const emails = [...emailSet];
+    let primaryEmail = null;
+    if (g.parentRow){
+      const pm = String(g.parentRow[COL.mainEmail]||'').match(EMAIL_RE);
+      if (pm) primaryEmail = pm[0].toLowerCase();
+    }
+    if (!primaryEmail && emails.length) primaryEmail = emails[0];
+
+    // --- notes + note-level flags + delivery hints ---
+    const parentNote = String(baseRow[COL.note]||'').trim();
+    const allNotes = allRows.map(r=>String(r[COL.note]||'')).join(' \n ');
+    const flags = [...meta.flags];
+    if (/DO NOT (HELP|SELL|SERVICE)/i.test(parentNote) && !flags.includes('DO_NOT_HELP') && !flags.includes('DO_NOT_SELL'))
+      flags.push('DO_NOT_SERVICE_NOTE');
+    const delivery = {
+      forklift: /forklift/i.test(allNotes),
+      liftgate: /lift\s*gate/i.test(allNotes),
+      callBefore: /call\s*(before|ahead)|notify before/i.test(allNotes)
+    };
+
+    // --- customer type ---
+    const rawType = String(baseRow[COL.type]||'').trim();
+    const typeTags = rawType ? rawType.split(':').map(s=>s.trim()).filter(Boolean) : [];
+
+    // --- units ---
+    const units = [];
+    for (const j of g.jobRows){
+      const u = parseUnit(j.suffix, j.row[COL.note]);
+      if (!u.date && u.seq === null) stats.unparsedUnits++;
+      units.push(u);
+    }
+    stats.units += units.length;
+
+    // --- dedup keys ---
+    const nname = normName(meta.displayName);
+    const nameTokens = nname ? nname.split(' ') : [];
+    const nameZipKey = (nameTokens.length && address.zip) ? nameTokens.slice().sort().join('_') + '|' + address.zip : null;
+
+    const internal = INTERNAL_PATTERNS.some(re=>re.test(parentName));
+    if (internal) stats.internal++;
+    if (meta.status==='inactive') stats.inactive++;
+    if (meta.status==='cancelled') stats.cancelled++;
+    if (flags.some(f=>f.startsWith('DO_NOT') || f==='BAD_DEBT')) stats.doNotService++;
+    if (flags.includes('AH')) stats.ah++;
+    if (!phones.length) stats.noPhone++;
+    if (!emails.length) stats.noEmail++;
+
+    customers.push({
+      // ID from the RAW QB name (unique natural key of the export).
+      // Never from the normalized display name: distinct QB customers like
+      // "Adams, Mike" vs "Adams, MIke." must stay separate docs — the dedup
+      // engine cross-links them via nameZipKey for manual review instead.
+      id: 'c_' + hash64(parentName.trim()),
+      qbName: meta.qbName, displayName: meta.displayName,
+      status: meta.status, flags, channel: meta.channel,
+      customerType: rawType || null, typeTags,
+      phones: phones.map(p=>({number:p.number,label:p.label||null,source:p.source})),
+      primaryPhone, phoneKeys: phones.map(p=>p.number),
+      emails, primaryEmail, emailKeys: emails,
+      address, accountNo: String(baseRow[COL.account]||'').trim() || null,
+      notes: parentNote || null, delivery,
+      nameTokens, nameZipKey,
+      unitCount: units.length, units,
+      internal, possibleDuplicateOf: []
+    });
+  }
+
+  // --- cross-customer dedup detection (report + cross-link, never merge) ---
+  const dupRows = [];
+  const link = (key, type, list) => {
+    if (list.length < 2) return;
+    dupRows.push({ key, type, names: list.map(c=>c.displayName) });
+    // shared store lines / generic emails: report only, skip O(n^2) cross-linking
+    if (list.length > 10) return;
+    for (const c of list)
+      for (const o of list)
+        if (o.id !== c.id && !c.possibleDuplicateOf.includes(o.id)) c.possibleDuplicateOf.push(o.id);
+  };
+  const byPhone = new Map(), byEmail = new Map(), byNameZip = new Map();
+  for (const c of customers){
+    for (const k of c.phoneKeys){ (byPhone.get(k)||byPhone.set(k,[]).get(k)).push(c); }
+    for (const k of c.emailKeys){ (byEmail.get(k)||byEmail.set(k,[]).get(k)).push(c); }
+    if (c.nameZipKey){ (byNameZip.get(c.nameZipKey)||byNameZip.set(c.nameZipKey,[]).get(c.nameZipKey)).push(c); }
+  }
+  byPhone.forEach((list,k)=>link(k,'phone',list));
+  byEmail.forEach((list,k)=>link(k,'email',list));
+  byNameZip.forEach((list,k)=>link(k,'name+zip',list));
+  stats.dupGroups = dupRows.length;
+
+  return { customers, stats, dupRows };
+}
+
+/* ================= UI: FILE LOAD + REVIEW ================= */
+$('fileInput').addEventListener('change', ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const wb = XLSX.read(e.target.result, { type:'array' });
+      // pick the sheet whose header row contains "Customer"
+      let rows = null;
+      for (const name of wb.SheetNames){
+        const js = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval:'' });
+        if (js.length && Object.keys(js[0]).includes(COL.customer)){ rows = js; break; }
+      }
+      if (!rows) throw new Error('No sheet with a "Customer" column found.');
+      MODEL = buildModel(rows);
+      renderReview();
+    } catch(err){ alert('Parse error: ' + err.message); console.error(err); }
+  };
+  reader.readAsArrayBuffer(f);
+});
+
+function renderReview(){
+  const s = MODEL.stats;
+  $('statsGrid').innerHTML = [
+    ['Rows in file', s.rows], ['Customers', s.parents], ['Units (jobs)', s.units],
+    ['Inactive', s.inactive, 'warn'], ['Cancelled', s.cancelled, 'warn'],
+    ['Do-not-service', s.doNotService, 'bad'], ['AH flagged', s.ah],
+    ['Internal accts', s.internal], ['No phone', s.noPhone, 'warn'],
+    ['No email', s.noEmail, 'warn'], ['Unparsed unit names', s.unparsedUnits, 'warn'],
+    ['Possible-dup groups', s.dupGroups, 'warn']
+  ].map(([l,n,cls])=>`<div class="stat ${cls||''}"><div class="n">${n.toLocaleString()}</div><div class="l">${l}</div></div>`).join('');
+
+  const dupBody = $('dupTable').querySelector('tbody');
+  dupBody.innerHTML = MODEL.dupRows.slice(0,200).map(d =>
+    `<tr><td><code>${esc(d.key)}</code></td><td>${esc(d.type)}</td>
+     <td>${d.names.slice(0,6).map(esc).join(' · ')}${d.names.length>6?` · +${d.names.length-6} more`:''}</td></tr>`
+  ).join('') || '<tr><td colspan="3" class="muted">None detected.</td></tr>';
+
+  const prevBody = $('prevTable').querySelector('tbody');
+  prevBody.innerHTML = MODEL.customers.slice(0,25).map(c => {
+    const badges = [
+      c.status==='inactive' ? '<span class="badge b-inactive">INACTIVE</span>' : '',
+      c.status==='cancelled' ? '<span class="badge b-cancel">CANCELLED</span>' : '',
+      c.flags.some(f=>f.startsWith('DO_NOT')||f==='BAD_DEBT') ? '<span class="badge b-dns">DO NOT SERVICE</span>' : '',
+      c.flags.includes('AH') ? '<span class="badge b-ah">AH</span>' : '',
+      c.channel ? `<span class="badge b-chan">${esc(c.channel)}</span>` : '',
+      c.possibleDuplicateOf.length ? '<span class="badge b-dup">DUP?</span>' : ''
+    ].join('');
+    return `<tr><td>${esc(c.displayName)}</td><td>${badges}</td>
+      <td>${esc(c.primaryPhone||'—')}</td><td>${esc(c.primaryEmail||'—')}</td>
+      <td>${esc([c.address.city,c.address.zip].filter(Boolean).join(' '))}</td>
+      <td>${c.unitCount}</td></tr>`;
+  }).join('');
+
+  $('reviewSection').classList.remove('hidden');
+  $('importSection').classList.remove('hidden');
+  refreshImportBtn();
+}
+
+/* ================= FIREBASE ================= */
+let db = null, ABORT = false;
+const LS_KEY = 'qbImportFbConfig';
+
+function setConn(txt, cls){ const el=$('connState'); el.textContent=txt; el.className='conn ' + (cls||''); }
+
+async function connect(cfgText){
+  let cfg;
+  try { cfg = JSON.parse(cfgText); } catch(e){ alert('Config is not valid JSON.'); return; }
+  try {
+    if (firebase.apps.length) firebase.app().delete && await firebase.app().delete();
+  } catch(e){ /* first run */ }
+  try {
+    firebase.initializeApp(cfg);
+    await firebase.auth().signInAnonymously();
+    db = firebase.firestore();
+    localStorage.setItem(LS_KEY, cfgText);
+    setConn('Firebase: connected (' + (cfg.projectId||'?') + ')', 'ok');
+  } catch(err){
+    setConn('Firebase: error', 'err');
+    alert('Firebase connection failed: ' + err.message +
+      '\n\nCheck: Anonymous Auth enabled + config belongs to tech-tickets-a9485.');
+    db = null;
+  }
+  refreshImportBtn();
+}
+$('btnConnect').addEventListener('click', ()=>connect($('fbConfig').value.trim()));
+$('btnForget').addEventListener('click', ()=>{
+  localStorage.removeItem(LS_KEY); $('fbConfig').value=''; db=null;
+  setConn('Firebase: not configured'); refreshImportBtn();
+});
+(function restore(){
+  const saved = localStorage.getItem(LS_KEY);
+  if (saved){ $('fbConfig').value = saved; connect(saved); }
+})();
+
+function refreshImportBtn(){ $('btnImport').disabled = !(db && MODEL); }
+
+/* ================= IMPORT ================= */
+function selectedCustomers(){
+  const skipInternal = $('optSkipInternal').checked;
+  const skipInactive = $('optSkipInactive').checked;
+  const skipCancelled = $('optSkipCancelled').checked;
+  return MODEL.customers.filter(c =>
+    !(skipInternal && c.internal) &&
+    !(skipInactive && c.status==='inactive') &&
+    !(skipCancelled && c.status==='cancelled'));
+}
+
+$('btnAbort').addEventListener('click', ()=>{ ABORT = true; });
+
+$('btnImport').addEventListener('click', async () => {
+  if (!db || !MODEL) return;
+  const list = selectedCustomers();
+  const withUnits = $('optUnits').checked;
+  const totalOps = list.reduce((n,c)=>n + 1 + (withUnits ? c.unitCount : 0), 0);
+  if (!confirm(`Import ${list.length.toLocaleString()} customers` +
+      (withUnits ? ` + ${(totalOps-list.length).toLocaleString()} units` : '') +
+      ` to Firestore (${totalOps.toLocaleString()} writes)?\n\nDeterministic IDs: re-running upserts, no duplicates.`)) return;
+
+  ABORT = false;
+  $('btnImport').disabled = true; $('btnAbort').classList.remove('hidden');
+  const t0 = Date.now();
+  log(`[${APP_VERSION}] Import started — ${list.length} customers, ${totalOps} total writes`);
+
+  let batch = db.batch(), ops = 0, done = 0, errors = 0;
+  const flush = async () => {
+    if (!ops) return;
+    await batch.commit();
+    batch = db.batch(); ops = 0;
+  };
+  const add = (ref, data) => { batch.set(ref, data, { merge:true }); ops++; };
+
+  try {
+    for (const c of list){
+      if (ABORT) throw new Error('Aborted by user');
+      const { units, internal, ...docData } = c;
+      docData.source = 'qb-import-v2';
+      docData.appVersion = APP_VERSION;
+      docData.importedAt = firebase.firestore.FieldValue.serverTimestamp();
+      const cref = db.collection('customers').doc(c.id);
+      add(cref, docData);
+      if (ops >= 450) await flush();
+      if (withUnits){
+        for (const u of units){
+          const uid = 'u_' + hash64(c.qbName + ':' + u.rawJobName);
+          add(cref.collection('units').doc(uid), { ...u, customerId:c.id });
+          if (ops >= 450) await flush();
+        }
+      }
+      done++;
+      if (done % 250 === 0 || done === list.length){
+        $('prog').value = Math.round(done/list.length*100);
+        $('progText').textContent = `${done.toLocaleString()} / ${list.length.toLocaleString()} customers`;
+        await new Promise(r=>setTimeout(r)); // let UI breathe
+      }
+    }
+    await flush();
+    const secs = ((Date.now()-t0)/1000).toFixed(1);
+    log(`DONE in ${secs}s — ${done} customers written, ${errors} errors.`);
+    $('progText').textContent = `Completed: ${done.toLocaleString()} customers in ${secs}s`;
+  } catch(err){
+    log('STOPPED: ' + err.message + ` (after ${done} customers)`);
+    alert('Import stopped: ' + err.message + '\nSafe to re-run — merge writes resume where it left off.');
+  } finally {
+    $('btnAbort').classList.add('hidden');
+    refreshImportBtn();
+  }
+});
+</script>
+</body>
+</html>
